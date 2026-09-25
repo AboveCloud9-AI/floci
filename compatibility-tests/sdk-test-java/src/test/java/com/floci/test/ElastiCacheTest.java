@@ -299,6 +299,38 @@ class ElastiCacheTest {
 
     @Test
     @Order(12)
+    void topLevelPasswordsAndAccessStringChangesRoundTrip() {
+        String passwordUserId = TestFixtures.uniqueName("ec-pw-user");
+        var created = elasticache.createUser(CreateUserRequest.builder()
+                .userId(passwordUserId)
+                .userName(TestFixtures.uniqueName("ec-pw-name"))
+                .engine("redis")
+                .accessString("on ~app:* -@all +@read")
+                .passwords("top-level-password-1")
+                .build());
+        assertThat(created.authentication().typeAsString()).isEqualTo("password");
+        assertThat(created.authentication().passwordCount()).isEqualTo(1);
+
+        try {
+            var appended = elasticache.modifyUser(ModifyUserRequest.builder()
+                    .userId(passwordUserId)
+                    .appendAccessString("+@write")
+                    .build());
+            assertThat(appended.accessString()).isEqualTo("on ~app:* -@all +@read +@write");
+
+            var opened = elasticache.modifyUser(ModifyUserRequest.builder()
+                    .userId(passwordUserId)
+                    .noPasswordRequired(true)
+                    .build());
+            assertThat(opened.authentication().typeAsString()).isEqualTo("no-password-required");
+            assertThat(opened.authentication().passwordCount()).isZero();
+        } finally {
+            elasticache.deleteUser(DeleteUserRequest.builder().userId(passwordUserId).build());
+        }
+    }
+
+    @Test
+    @Order(13)
     void deleteReplicationGroupReleasesPortForReuse() {
         requireGroup();
 
