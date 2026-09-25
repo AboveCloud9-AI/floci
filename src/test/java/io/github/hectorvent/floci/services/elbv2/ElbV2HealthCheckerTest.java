@@ -179,7 +179,7 @@ class ElbV2HealthCheckerTest {
     }
 
     @Test
-    void trafficPortKeywordProbesTargetPort() {
+    void trafficPortKeywordOrInvalidPortProbesTargetPort() {
         TargetGroup targetGroup = new TargetGroup();
         targetGroup.setHealthCheckPort("traffic-port");
         assertEquals(50051, ElbV2HealthChecker.healthCheckPort(targetGroup, 50051));
@@ -187,6 +187,10 @@ class ElbV2HealthCheckerTest {
         assertEquals(50051, ElbV2HealthChecker.healthCheckPort(targetGroup, 50051));
         targetGroup.setHealthCheckPort("8080");
         assertEquals(8080, ElbV2HealthChecker.healthCheckPort(targetGroup, 50051));
+        targetGroup.setHealthCheckPort("70000");
+        assertEquals(50051, ElbV2HealthChecker.healthCheckPort(targetGroup, 50051));
+        targetGroup.setHealthCheckPort("not-a-port");
+        assertEquals(50051, ElbV2HealthChecker.healthCheckPort(targetGroup, 50051));
     }
 
     @Test

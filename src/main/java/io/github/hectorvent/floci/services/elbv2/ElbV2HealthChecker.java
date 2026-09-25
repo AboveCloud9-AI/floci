@@ -213,18 +213,31 @@ public class ElbV2HealthChecker implements Resettable {
     /**
      * AWS probes {@code HealthCheckPort} when it is a number and the target's own port when it is
      * {@code traffic-port} or unset. Health state stays keyed by the traffic port either way.
+     * A stored value that is not a valid port, which the API accepted before it validated the
+     * field, keeps probing the traffic port as before.
      */
     static int healthCheckPort(TargetGroup tg, int trafficPort) {
         String configured = tg.getHealthCheckPort();
         if (configured == null || configured.isBlank() || "traffic-port".equals(configured)) {
             return trafficPort;
         }
-        try {
-            return Integer.parseInt(configured.trim());
-        } catch (NumberFormatException e) {
-            LOG.debugv("Target group {0} has non-numeric HealthCheckPort {1}; probing traffic port {2}",
+        Integer port = parsePort(configured);
+        if (port == null) {
+            LOG.debugv("Target group {0} has invalid HealthCheckPort {1}; probing traffic port {2}",
                     tg.getTargetGroupArn(), configured, trafficPort);
             return trafficPort;
+        }
+        return port;
+    }
+
+    /** Returns the port number {@code value} names, or null when it is not a port from 1 to 65535. */
+    static Integer parsePort(String value) {
+        try {
+            int port = Integer.parseInt(value.trim());
+            return port >= 1 && port <= 65535 ? port : null;
+        } catch (NumberFormatException ignored) {
+            // Not a number: the caller treats it the same as an out-of-range port.
+            return null;
         }
     }
 
