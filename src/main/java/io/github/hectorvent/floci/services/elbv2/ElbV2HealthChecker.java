@@ -151,9 +151,10 @@ public class ElbV2HealthChecker implements Resettable {
             int timeout = tg.getHealthCheckTimeoutSeconds() != null ? tg.getHealthCheckTimeoutSeconds() : 5;
             int healthyThreshold = tg.getHealthyThresholdCount() != null ? tg.getHealthyThresholdCount() : 5;
             int unhealthyThreshold = tg.getUnhealthyThresholdCount() != null ? tg.getUnhealthyThresholdCount() : 2;
+            int probePort = healthCheckPort(tg, port);
 
             vertx.executeBlocking(() -> {
-                return probe(host, port, path, timeout);
+                return probe(host, probePort, path, timeout);
             }).onSuccess(statusCode -> {
                 boolean success = matchesStatusCode(statusCode, matcher);
                 if (success) {
@@ -206,6 +207,24 @@ public class ElbV2HealthChecker implements Resettable {
             return conn.getResponseCode();
         } finally {
             conn.disconnect();
+        }
+    }
+
+    /**
+     * AWS probes {@code HealthCheckPort} when it is a number and the target's own port when it is
+     * {@code traffic-port} or unset. Health state stays keyed by the traffic port either way.
+     */
+    static int healthCheckPort(TargetGroup tg, int trafficPort) {
+        String configured = tg.getHealthCheckPort();
+        if (configured == null || configured.isBlank() || "traffic-port".equals(configured)) {
+            return trafficPort;
+        }
+        try {
+            return Integer.parseInt(configured.trim());
+        } catch (NumberFormatException e) {
+            LOG.debugv("Target group {0} has non-numeric HealthCheckPort {1}; probing traffic port {2}",
+                    tg.getTargetGroupArn(), configured, trafficPort);
+            return trafficPort;
         }
     }
 
