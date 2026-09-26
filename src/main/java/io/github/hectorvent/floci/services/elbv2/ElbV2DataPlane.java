@@ -319,10 +319,41 @@ public class ElbV2DataPlane {
         if (listenerArn != null) {
             return listenerArn;
         }
+        // Backported from upstream (post-2.1.0): with several load balancers on one port, the
+        // one whose host-header rules name this Host claims the request. 2.1.0 went straight to
+        // "only one listener on the port", so two internal ALBs on :50051 answered
+        // "No listener for host" for every hostname that was not an ALB's own DNS name.
+        List<String> declaring = listenersDeclaringHost(listenersByHost, host);
+        if (declaring.size() == 1) {
+            return declaring.get(0);
+        }
+        if (declaring.size() > 1) {
+            LOG.debugv("ELBv2 port {0}: {1} listeners declare Host {2} in a host-header condition, "
+                    + "so none of them can claim it", String.valueOf(port),
+                    String.valueOf(declaring.size()), host);
+            return null;
+        }
         if (listenersByHost.size() == 1) {
             return listenersByHost.values().iterator().next();
         }
         return null;
+    }
+
+    private List<String> listenersDeclaringHost(Map<String, String> listenersByHost, String host) {
+        List<String> declaring = new ArrayList<>();
+        for (String listenerArn : listenersByHost.values()) {
+            AtomicReference<List<CompiledRule>> ref = ruleChains.get(listenerArn);
+            if (ref == null) {
+                continue;
+            }
+            for (CompiledRule compiled : ref.get()) {
+                if (compiled.declaresHost(host)) {
+                    declaring.add(listenerArn);
+                    break;
+                }
+            }
+        }
+        return declaring;
     }
 
     private static String normalizeHost(String host) {
@@ -773,10 +804,33 @@ public class ElbV2DataPlane {
     private class CompiledRule {
         final Rule rule;
         final Action action;
+        final List<String> hostHeaderPatterns;
 
         CompiledRule(Rule rule) {
             this.rule = rule;
             this.action = getRoutingAction(rule);
+            this.hostHeaderPatterns = hostHeaderPatterns(rule);
+        }
+
+        /** Host names this rule's host-header conditions declare; the default rule declares none. */
+        private static List<String> hostHeaderPatterns(Rule rule) {
+            if (rule.isDefault() || rule.getConditions() == null) {
+                return List.of();
+            }
+            List<String> patterns = new ArrayList<>();
+            for (RuleCondition condition : rule.getConditions()) {
+                if (!"host-header".equals(condition.getField())) {
+                    continue;
+                }
+                patterns.addAll(condition.getHostHeaderValues().isEmpty()
+                        ? condition.getValues()
+                        : condition.getHostHeaderValues());
+            }
+            return patterns;
+        }
+
+        boolean declaresHost(String host) {
+            return hostHeaderPatterns.stream().anyMatch(p -> globMatches(p, host));
         }
 
         boolean matches(io.vertx.core.http.HttpServerRequest req) {
