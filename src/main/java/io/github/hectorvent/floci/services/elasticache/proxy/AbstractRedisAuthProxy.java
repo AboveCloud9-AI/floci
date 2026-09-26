@@ -8,6 +8,8 @@ import java.io.OutputStream;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.List;
 
 /**
  * Shared TCP auth-proxy skeleton for the Redis (RESP) wire protocol. Intercepts the
@@ -29,6 +31,13 @@ public abstract class AbstractRedisAuthProxy {
     private static final byte[] WRONG_ARGS_RESPONSE =
             "-ERR wrong number of arguments for 'auth' command\r\n"
                     .getBytes(StandardCharsets.UTF_8);
+    // the engine's own replies for HELLO, so clients see what ElastiCache sends
+    private static final byte[] HELLO_NOAUTH_RESPONSE =
+            ("-NOAUTH HELLO must be called with the client already authenticated, otherwise the "
+                    + "HELLO <proto> AUTH <user> <pass> option can be used to authenticate the client and "
+                    + "select the RESP protocol version at the same time\r\n").getBytes(StandardCharsets.UTF_8);
+    private static final byte[] HELLO_AUTH_SYNTAX_RESPONSE =
+            "-ERR Syntax error in HELLO option 'auth'\r\n".getBytes(StandardCharsets.UTF_8);
 
     private final Logger log;
     private final String serviceName;
@@ -96,26 +105,36 @@ public abstract class AbstractRedisAuthProxy {
         try {
             client.setTcpNoDelay(true);
             RespReader reader = new RespReader(client.getInputStream());
-            String[] cmd = reader.readCommand();
-
-            if (cmd.length == 0) {
-                closeQuietly(client);
-                return;
-            }
-
-            if (cmd[0].equalsIgnoreCase("AUTH")) {
-                handleAuth(client, cmd);
-            } else if (authRequired()) {
-                client.getOutputStream().write(NOAUTH_RESPONSE);
-                client.getOutputStream().flush();
-                closeQuietly(client);
-            } else {
-                // No auth required and no AUTH command: bridge immediately.
-                // First re-send the already-read command to the backend.
-                Socket backend = new Socket(backendHost, backendPort);
-                backend.setTcpNoDelay(true);
-                resendCommand(cmd, backend.getOutputStream());
-                bridge(client, backend);
+            // As on the engine, a refused command leaves the connection open, unauthenticated,
+            // for the client's next attempt. Closing instead would reset the connection while a
+            // client that pipelines its handshake still has commands in flight, and the client
+            // would see EOF rather than the error.
+            while (true) {
+                String[] cmd = reader.readCommand();
+                if (cmd.length == 0) {
+                    closeQuietly(client);
+                    return;
+                }
+                if (cmd[0].equalsIgnoreCase("AUTH")) {
+                    if (handleAuth(client, cmd)) {
+                        return;
+                    }
+                } else if (cmd[0].equalsIgnoreCase("HELLO")) {
+                    if (handleHello(client, cmd)) {
+                        return;
+                    }
+                } else if (authRequired()) {
+                    client.getOutputStream().write(NOAUTH_RESPONSE);
+                    client.getOutputStream().flush();
+                } else {
+                    // No auth required and no AUTH command: bridge immediately.
+                    // First re-send the already-read command to the backend.
+                    Socket backend = new Socket(backendHost, backendPort);
+                    backend.setTcpNoDelay(true);
+                    resendCommand(cmd, backend.getOutputStream());
+                    bridge(client, backend);
+                    return;
+                }
             }
         } catch (Exception e) {
             log.debugv("Connection error for {0}: {1}", resourceId, e.getMessage());
@@ -123,7 +142,8 @@ public abstract class AbstractRedisAuthProxy {
         }
     }
 
-    private void handleAuth(Socket client, String[] cmd) throws IOException {
+    /** Returns whether the connection was handed to the backend; false leaves it with the client. */
+    private boolean handleAuth(Socket client, String[] cmd) throws IOException {
         String username;
         String password;
 
@@ -138,16 +158,13 @@ public abstract class AbstractRedisAuthProxy {
         } else {
             client.getOutputStream().write(WRONG_ARGS_RESPONSE);
             client.getOutputStream().flush();
-            closeQuietly(client);
-            return;
+            return false;
         }
 
-        boolean authenticated = !authRequired() || authenticate(username, password);
-        if (!authenticated) {
+        if (!credentialsAccepted(username, password)) {
             client.getOutputStream().write(INVALID_AUTH_RESPONSE);
             client.getOutputStream().flush();
-            closeQuietly(client);
-            return;
+            return false;
         }
 
         client.getOutputStream().write(OK_RESPONSE);
@@ -156,6 +173,64 @@ public abstract class AbstractRedisAuthProxy {
         Socket backend = new Socket(backendHost, backendPort);
         backend.setTcpNoDelay(true);
         bridge(client, backend);
+        return true;
+    }
+
+    /**
+     * {@code HELLO [protover [AUTH username password] [SETNAME clientname]]}, which RESP3 clients
+     * such as valkey-go, go-redis and Lettuce send instead of AUTH. The credentials are checked
+     * here like AUTH's; the rest of the command goes to the backend, whose reply the client gets.
+     */
+    private boolean handleHello(Socket client, String[] cmd) throws IOException {
+        List<String> forwarded = new ArrayList<>();
+        forwarded.add(cmd[0]);
+        String username = null;
+        String password = null;
+        boolean hasAuth = false;
+        for (int i = 1; i < cmd.length; i++) {
+            if (cmd[i].equalsIgnoreCase("AUTH")) {
+                if (i + 2 >= cmd.length) {
+                    client.getOutputStream().write(HELLO_AUTH_SYNTAX_RESPONSE);
+                    client.getOutputStream().flush();
+                    return false;
+                }
+                hasAuth = true;
+                username = cmd[i + 1];
+                password = cmd[i + 2];
+                i += 2;
+            } else {
+                forwarded.add(cmd[i]);
+            }
+        }
+
+        if (!hasAuth && authRequired()) {
+            client.getOutputStream().write(HELLO_NOAUTH_RESPONSE);
+            client.getOutputStream().flush();
+            return false;
+        }
+        if (hasAuth && !credentialsAccepted(username, password)) {
+            client.getOutputStream().write(INVALID_AUTH_RESPONSE);
+            client.getOutputStream().flush();
+            return false;
+        }
+
+        Socket backend = new Socket(backendHost, backendPort);
+        backend.setTcpNoDelay(true);
+        resendCommand(forwarded.toArray(String[]::new), backend.getOutputStream());
+        bridge(client, backend);
+        return true;
+    }
+
+    /**
+     * As on Redis 6+, the user {@code default} with a password is the same login as the
+     * single-argument form, so {@code AUTH default <auth-token>} works like {@code AUTH <auth-token>}.
+     */
+    private boolean credentialsAccepted(String username, String password) {
+        if (!authRequired()) {
+            return true;
+        }
+        return authenticate(username, password)
+                || ("default".equals(username) && authenticate(null, password));
     }
 
     /**
