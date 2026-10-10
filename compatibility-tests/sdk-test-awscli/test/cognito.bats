@@ -254,3 +254,24 @@ teardown() {
     sub_mutable=$(echo "$output" | jq '[.UserPool.SchemaAttributes[] | select(.Name == "sub")] | .[0].Mutable')
     [ "$sub_mutable" = "false" ]
 }
+
+@test "Cognito: describe-user-pool reports the pool's prefix domain until it is deleted" {
+    out=$(aws_cmd cognito-idp create-user-pool --pool-name "bats-test-pool-$(unique_name)")
+    POOL_ID=$(json_get "$out" '.UserPool.Id')
+    domain=$(unique_name bats-domain)
+
+    run aws_cmd cognito-idp describe-user-pool --user-pool-id "$POOL_ID"
+    assert_success
+    [ "$(json_get "$output" '.UserPool.Domain')" = "null" ]
+
+    aws_cmd cognito-idp create-user-pool-domain --domain "$domain" --user-pool-id "$POOL_ID" >/dev/null
+    run aws_cmd cognito-idp describe-user-pool --user-pool-id "$POOL_ID"
+    assert_success
+    [ "$(json_get "$output" '.UserPool.Domain')" = "$domain" ]
+    [ "$(json_get "$output" '.UserPool.CustomDomain')" = "null" ]
+
+    aws_cmd cognito-idp delete-user-pool-domain --domain "$domain" --user-pool-id "$POOL_ID" >/dev/null
+    run aws_cmd cognito-idp describe-user-pool --user-pool-id "$POOL_ID"
+    assert_success
+    [ "$(json_get "$output" '.UserPool.Domain')" = "null" ]
+}

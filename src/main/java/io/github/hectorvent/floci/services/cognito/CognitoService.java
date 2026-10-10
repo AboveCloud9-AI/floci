@@ -1729,6 +1729,17 @@ public class CognitoService implements ResourceProvider {
                 .findFirst();
     }
 
+    /**
+     * The pool's prefix domain, or with {@code custom} its custom domain: what DescribeUserPool
+     * reports as {@code Domain} and {@code CustomDomain}. Read from the domain store on every call,
+     * so a deleted domain leaves the pool too. Scoped to the request's account, like the pool.
+     */
+    public Optional<UserPoolDomain> findUserPoolDomain(String poolId, boolean custom) {
+        return domainStore.scan(k -> true).stream()
+                .filter(d -> poolId.equals(d.getUserPoolId()) && d.isCustomDomain() == custom)
+                .findFirst();
+    }
+
     private List<UserPoolDomain> allDomains() {
         return domainStore instanceof AccountAwareStorageBackend<UserPoolDomain> aware
                 ? aware.scanAllAccounts()

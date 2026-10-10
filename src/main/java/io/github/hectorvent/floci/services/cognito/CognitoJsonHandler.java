@@ -1131,6 +1131,8 @@ public class CognitoJsonHandler {
         node.put("Status", p.getStatus());
         node.put("CreationDate", (double) p.getCreationDate());
         node.put("LastModifiedDate", (double) p.getLastModifiedDate());
+        service.findUserPoolDomain(p.getId(), false).ifPresent(d -> node.put("Domain", d.getDomain()));
+        service.findUserPoolDomain(p.getId(), true).ifPresent(d -> node.put("CustomDomain", d.getDomain()));
 
         node.set("Policies", objectMapper.valueToTree(p.getPolicies() != null ? p.getPolicies() : new HashMap<>()));
         node.put("DeletionProtection", p.getDeletionProtection() != null ? p.getDeletionProtection() : "INACTIVE");
