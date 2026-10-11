@@ -64,6 +64,7 @@ class CognitoManagedLoginIntegrationTest {
     private static final String INCORRECT_CREDENTIALS = "Incorrect username or password";
     private static final Pattern HIDDEN_FIELD = Pattern.compile("<input type=\"hidden\" name=\"([^\"]*)\" value=\"([^\"]*)\">");
     private static final Pattern FORM_ACTION = Pattern.compile("<form method=\"post\" action=\"([^\"]*)\">");
+    private static final Pattern PROVIDER_LINK = Pattern.compile("<a href=\"([^\"]*)\">Sign in with ([^<]*)</a>");
     private static final Pattern SIX_DIGIT_CODE = Pattern.compile("\\b(\\d{6})\\b");
     private static final String PRE_TOKEN_GENERATION_ARN = "arn:aws:lambda:::pre-token-generation";
     private static final String ADMIN_SCOPE = "aws.cognito.signin.user.admin";
@@ -611,23 +612,89 @@ class CognitoManagedLoginIntegrationTest {
     }
 
     @Test
-    void clientWithoutCognitoAmongItsProvidersCannotUseManagedLogin() throws Exception {
+    void clientWithOnlyExternalProvidersGetsAPageOfTheirLinks() throws Exception {
         String poolId = cognitoJson("CreateUserPool", "{\"PoolName\":\"FederatedOnlyPool\"}").path("UserPool").path("Id").asText();
+        createExampleOidcProvider(poolId);
+        String clientId = providerClient(poolId, "\"ExampleOidc\"");
+        Map<String, String> query = authorizeRequest(clientId);
+
+        String location = browserGet(null, "/cognito-idp/oauth2/authorize", query, null)
+                .then().statusCode(302).extract().header("Location");
+        assertEquals("/cognito-idp/login", URI.create(location).getPath());
+        String html = follow(null, location).then().statusCode(200).extract().asString();
+
+        assertFalse(FORM_ACTION.matcher(html).find(), "no sign-in form for a client without COGNITO: " + html);
+        assertEquals(List.of("ExampleOidc"), List.copyOf(providerLinks(html).keySet()));
+        assertProviderLinkRepeatsTheRequest(providerLinks(html).get("ExampleOidc"), query, "ExampleOidc");
+
+        Map<String, String> namingCognito = new LinkedHashMap<>(query);
+        namingCognito.put("identity_provider", "COGNITO");
+        browserGet(null, "/cognito-idp/oauth2/authorize", namingCognito, null)
+                .then().statusCode(400).body("error", equalTo("invalid_request"));
+        given().redirects().follow(false).queryParams(query)
+                .formParam("username", "anyone").formParam("password", PASSWORD)
+                .when().post("/cognito-idp/login")
+                .then().statusCode(400).body("error", equalTo("invalid_request"));
+    }
+
+    @Test
+    void signInPageLinksToTheClientsExternalProvidersBesideTheForm() throws Exception {
+        String poolId = cognitoJson("CreateUserPool", "{\"PoolName\":\"MixedProvidersPool\"}").path("UserPool").path("Id").asText();
+        createExampleOidcProvider(poolId);
+        String clientId = providerClient(poolId, "\"COGNITO\",\"ExampleOidc\"");
+        Map<String, String> query = authorizeRequest(clientId);
+
+        String html = loginPage(null, "/cognito-idp/oauth2/authorize", query).asString();
+
+        assertEquals("/cognito-idp/login", formAction(html));
+        Map<String, String> links = providerLinks(html);
+        assertEquals(List.of("ExampleOidc"), List.copyOf(links.keySet()));
+        String href = links.get("ExampleOidc");
+        assertProviderLinkRepeatsTheRequest(href, query, "ExampleOidc");
+
+        String providerLocation = follow(null, href).then().statusCode(302).extract().header("Location");
+        assertTrue(providerLocation.startsWith("https://idp.example.test/authorize?"), providerLocation);
+
+        String cognitoOnly = cognitoJson("CreateUserPoolClient", """
+                {"UserPoolId":"%s","ClientName":"cognito-only","AllowedOAuthFlowsUserPoolClient":true,
+                 "AllowedOAuthFlows":["code"],"AllowedOAuthScopes":["openid","email"],"CallbackURLs":["%s"],
+                 "SupportedIdentityProviders":["COGNITO"]}
+                """.formatted(poolId, CALLBACK)).path("UserPoolClient").path("ClientId").asText();
+        assertTrue(providerLinks(loginPage(null, "/cognito-idp/oauth2/authorize", authorizeRequest(cognitoOnly))
+                .asString()).isEmpty(), "a provider the client does not support is not offered");
+    }
+
+    private static void createExampleOidcProvider(String poolId) throws Exception {
         cognitoJson("CreateIdentityProvider", """
                 {"UserPoolId":"%s","ProviderName":"ExampleOidc","ProviderType":"OIDC",
                  "ProviderDetails":{"authorize_url":"https://idp.example.test/authorize","client_id":"idp-client","attributes_request_method":"GET","oidc_issuer":"https://idp.example.test"}}
                 """.formatted(poolId));
-        String clientId = cognitoJson("CreateUserPoolClient", """
-                {"UserPoolId":"%s","ClientName":"federated-only","AllowedOAuthFlowsUserPoolClient":true,
-                 "AllowedOAuthFlows":["code"],"AllowedOAuthScopes":["openid","email"],"CallbackURLs":["%s"],
-                 "SupportedIdentityProviders":["ExampleOidc"]}
-                """.formatted(poolId, CALLBACK)).path("UserPoolClient").path("ClientId").asText();
-        Map<String, String> query = authorizeRequest(clientId);
+    }
 
-        browserGet(null, "/cognito-idp/oauth2/authorize", query, null)
-                .then().statusCode(400).body("error", equalTo("invalid_request"));
-        browserGet(null, "/cognito-idp/login", query, null)
-                .then().statusCode(400).body("error", equalTo("invalid_request"));
+    private static String providerClient(String poolId, String providers) throws Exception {
+        return cognitoJson("CreateUserPoolClient", """
+                {"UserPoolId":"%s","ClientName":"with-providers","AllowedOAuthFlowsUserPoolClient":true,
+                 "AllowedOAuthFlows":["code"],"AllowedOAuthScopes":["openid","email"],"CallbackURLs":["%s"],
+                 "SupportedIdentityProviders":[%s]}
+                """.formatted(poolId, CALLBACK, providers)).path("UserPoolClient").path("ClientId").asText();
+    }
+
+    /** The sign-in page's provider links, by the provider each one names, with their HTML-unescaped targets. */
+    private static Map<String, String> providerLinks(String html) {
+        Map<String, String> links = new LinkedHashMap<>();
+        Matcher matcher = PROVIDER_LINK.matcher(html);
+        while (matcher.find()) {
+            links.put(unescapeHtml(matcher.group(2)), unescapeHtml(matcher.group(1)));
+        }
+        return links;
+    }
+
+    /** A provider link is the authorize endpoint again, with the request's parameters and the provider added. */
+    private static void assertProviderLinkRepeatsTheRequest(String href, Map<String, String> query, String provider) {
+        assertEquals("/cognito-idp/oauth2/authorize", URI.create(href).getPath());
+        Map<String, String> expected = new LinkedHashMap<>(query);
+        expected.put("identity_provider", provider);
+        assertEquals(expected, queryOf(href));
     }
 
     @Test

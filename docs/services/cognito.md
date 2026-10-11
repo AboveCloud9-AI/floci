@@ -451,8 +451,9 @@ users and through a federated OIDC provider, as well as the emulator-friendly
 client-credentials flow:
 
 - `GET /cognito-idp/oauth2/authorize` validates the app client and callback. With no
-  `identity_provider`, or `identity_provider=COGNITO`, it starts managed login (below);
-  with any other provider name it redirects to that OIDC provider with an opaque state and nonce.
+  `identity_provider` it goes to the managed login page (below), which offers every provider the
+  client supports; `identity_provider=COGNITO` starts managed login for the pool's own users, and
+  any other provider name redirects to that OIDC provider with an opaque state and nonce.
 - `GET /cognito-idp/oauth2/idpresponse` consumes the provider state, exchanges the provider
   code and redirects to the registered callback with a one-time Cognito authorization code.
 - `POST /cognito-idp/oauth2/token` redeems that authorization code once, checking its PKCE
@@ -461,9 +462,10 @@ client-credentials flow:
 
 ### Managed login
 
-Managed login signs in the pool's own users with authorization code and, optionally, PKCE.
-The client needs `COGNITO` in `SupportedIdentityProviders`, `AllowedOAuthFlows=["code"]` and
-the callback in `CallbackURLs`. No domain is needed; on a custom domain the same flow runs at
+Managed login signs in the pool's own users with authorization code and, optionally, PKCE,
+and links to the client's external providers. The client needs `AllowedOAuthFlows=["code"]`, the
+callback in `CallbackURLs`, and `COGNITO`, an external provider, or both in
+`SupportedIdentityProviders`. No domain is needed; on a custom domain the same flow runs at
 `/oauth2/authorize`, `/login` and `/logout`.
 
 1. `GET /cognito-idp/oauth2/authorize` redirects to `/cognito-idp/login` with the request's
@@ -475,7 +477,11 @@ the callback in `CallbackURLs`. No domain is needed; on a custom domain the same
 2. `GET /cognito-idp/login` renders a plain username and password form, with the username filled
    in from `login_hint` when the request has one. The form carries the request in hidden fields and
    a CSRF token that must match the `XSRF-TOKEN` cookie set with it. With choice-based sign-in
-   (below), it asks for the username alone.
+   (below), it asks for the username alone. Below the form, the page links to each external
+   provider in the client's `SupportedIdentityProviders` that exists in the pool, as AWS's page
+   does: each link is the authorization request again with `identity_provider=<ProviderName>`.
+   A client without `COGNITO` gets only those links, and no form; `identity_provider=COGNITO`
+   and a password post are refused for it with `invalid_request`.
 3. `POST /cognito-idp/login` checks the password as `USER_PASSWORD_AUTH` does, including
    sign-in aliases and the pre and post authentication and user migration triggers, but
    without the client's `ExplicitAuthFlows`. On success it sets a `cognito` session cookie

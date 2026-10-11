@@ -6,6 +6,7 @@ import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.services.cognito.model.CognitoAuthorizationCode;
 import io.github.hectorvent.floci.services.cognito.model.CognitoAuthorizationTransaction;
 import io.github.hectorvent.floci.services.cognito.model.CognitoUser;
+import io.github.hectorvent.floci.services.cognito.model.IdentityProvider;
 import io.github.hectorvent.floci.services.cognito.model.UserPool;
 import io.github.hectorvent.floci.services.cognito.model.UserPoolClient;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -33,10 +34,12 @@ import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
 import java.util.Base64;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.regex.Pattern;
 
 @ApplicationScoped
@@ -77,10 +80,10 @@ public class CognitoOAuthController {
     }
 
     /**
-     * Without an {@code identity_provider}, or with {@code COGNITO}, signs in one of the pool's own
-     * users through managed login; any other value names an external provider to federate with.
-     * A client that does not list COGNITO cannot use managed login, even when it supports exactly
-     * one other provider: the caller names that provider instead.
+     * With {@code identity_provider} naming an external provider, federates with it. Otherwise the
+     * browser goes to managed login: {@code COGNITO} names the pool's own users, and with no
+     * {@code identity_provider} the sign-in page offers every provider the client supports, as AWS
+     * does, so a client that supports only external providers gets a page of provider links.
      */
     @GET
     @Path("/cognito-idp/oauth2/authorize")
@@ -100,7 +103,7 @@ public class CognitoOAuthController {
                 relyingPartyState, nonce, codeChallenge, codeChallengeMethod, loginHint);
         String provider = trimToNull(providerName);
         if (provider == null || COGNITO_PROVIDER.equals(provider)) {
-            return authorizeWithManagedLogin(requestContext, request, sessionId);
+            return authorizeWithManagedLogin(requestContext, request, sessionId, provider != null);
         }
 
         AuthorizationCheck check = checkAuthorizationRequest(requestContext, request);
@@ -120,17 +123,23 @@ public class CognitoOAuthController {
 
     /**
      * AWS skips the sign-in form for a browser that already has a session in the pool, and otherwise
-     * redirects to the login endpoint with the request's parameters.
+     * redirects to the login endpoint with the request's parameters. {@code cognitoNamed} is an
+     * explicit {@code identity_provider=COGNITO}, which the client must support; without it, a client
+     * that supports only external providers is sent to the page of their links.
      */
     private Response authorizeWithManagedLogin(ContainerRequestContext requestContext, AuthorizationRequest request,
-                                               String sessionId) {
-        AuthorizationCheck check = checkManagedLoginRequest(requestContext, request);
+                                               String sessionId, boolean cognitoNamed) {
+        AuthorizationCheck check = cognitoNamed
+                ? checkManagedLoginRequest(requestContext, request)
+                : checkSignInPageRequest(requestContext, request);
         if (check.error() != null) {
             return check.error();
         }
-        Optional<String> code = issueAuthorizationCode(sessionId, check.client(), request);
-        if (code.isPresent()) {
-            return redirectWithCode(request, code.get());
+        if (supportsCognito(check.client())) {
+            Optional<String> code = issueAuthorizationCode(sessionId, check.client(), request);
+            if (code.isPresent()) {
+                return redirectWithCode(request, code.get());
+            }
         }
         return Response.status(Response.Status.FOUND)
                 .header(HttpHeaders.LOCATION, loginPath(requestContext) + "?" + formEncode(request.parameters()))
@@ -152,9 +161,12 @@ public class CognitoOAuthController {
                               @QueryParam("login_hint") String loginHint) {
         AuthorizationRequest request = new AuthorizationRequest(responseType, clientId, redirectUri, scope, state,
                 nonce, codeChallenge, codeChallengeMethod, loginHint);
-        AuthorizationCheck check = checkManagedLoginRequest(requestContext, request);
+        AuthorizationCheck check = checkSignInPageRequest(requestContext, request);
         if (check.error() != null) {
             return check.error();
+        }
+        if (!supportsCognito(check.client())) {
+            return signInPage(requestContext, request, Response.Status.OK, null, true, List.of());
         }
         return firstPage(requestContext, request, !managedLoginService.choiceBasedFactors(check.client()).isEmpty(),
                 Response.Status.OK, null, null);
@@ -328,7 +340,7 @@ public class CognitoOAuthController {
         } else if (trimToNull(redirectUri) != null) {
             AuthorizationRequest request = new AuthorizationRequest(responseType, clientId, redirectUri, scope,
                     state, nonce, codeChallenge, codeChallengeMethod, null);
-            AuthorizationCheck check = checkManagedLoginRequest(requestContext, request);
+            AuthorizationCheck check = checkSignInPageRequest(requestContext, request);
             if (check.error() != null) {
                 return check.error();
             }
@@ -612,15 +624,53 @@ public class CognitoOAuthController {
         return redirect(request.redirectUri(), parameters);
     }
 
-    /** An authorization request that managed login answers, at the authorize, login, and logout endpoints. */
+    /**
+     * An authorization request that signs in one of the pool's own users: the sign-in form's posts, and
+     * {@code identity_provider=COGNITO}.
+     */
     private AuthorizationCheck checkManagedLoginRequest(ContainerRequestContext requestContext,
                                                         AuthorizationRequest request) {
         AuthorizationCheck check = checkAuthorizationRequest(requestContext, request);
-        if (check.error() == null && !check.client().getSupportedIdentityProviders().contains(COGNITO_PROVIDER)) {
+        if (check.error() == null && !supportsCognito(check.client())) {
             return AuthorizationCheck.rejected(
                     oauthError("invalid_request", "COGNITO is not a supported identity provider for this client"));
         }
         return check;
+    }
+
+    /**
+     * An authorization request that gets the sign-in page, at the authorize, login, and logout endpoints.
+     * AWS's app client must support the pool's own users or at least one external provider, and the page
+     * offers each of them.
+     */
+    private AuthorizationCheck checkSignInPageRequest(ContainerRequestContext requestContext,
+                                                      AuthorizationRequest request) {
+        AuthorizationCheck check = checkAuthorizationRequest(requestContext, request);
+        if (check.error() == null && !supportsCognito(check.client())
+                && signInProviders(check.client()).isEmpty()) {
+            return AuthorizationCheck.rejected(
+                    oauthError("invalid_request", "COGNITO is not a supported identity provider for this client"));
+        }
+        return check;
+    }
+
+    private static boolean supportsCognito(UserPoolClient client) {
+        return client.getSupportedIdentityProviders().contains(COGNITO_PROVIDER);
+    }
+
+    /** The external providers the sign-in page links to: the client's, in its order, that exist in the pool. */
+    private List<String> signInProviders(UserPoolClient client) {
+        Set<String> registered = new HashSet<>();
+        for (IdentityProvider provider : cognitoService.listIdentityProviders(client.getUserPoolId())) {
+            registered.add(provider.getProviderName());
+        }
+        List<String> providers = new ArrayList<>();
+        for (String name : client.getSupportedIdentityProviders()) {
+            if (!COGNITO_PROVIDER.equals(name) && registered.contains(name)) {
+                providers.add(name);
+            }
+        }
+        return providers;
     }
 
     /** As on AWS, a client of another pool does not exist on a pool's custom domain. */
@@ -701,6 +751,26 @@ public class CognitoOAuthController {
                 ? "/login" : "/cognito-idp/login";
     }
 
+    private static String authorizePath(ContainerRequestContext requestContext) {
+        return requestContext.getProperty(CognitoCustomDomainFilter.POOL_PROPERTY) != null
+                ? "/oauth2/authorize" : "/cognito-idp/oauth2/authorize";
+    }
+
+    /**
+     * One link per external provider the client supports: the authorization request again, with
+     * {@code identity_provider} naming the provider, which AWS's sign-in page buttons send.
+     */
+    private List<String> providerLinks(ContainerRequestContext requestContext, AuthorizationRequest request) {
+        List<String> links = new ArrayList<>();
+        for (String provider : signInProviders(cognitoService.findClientById(request.clientId()))) {
+            Map<String, String> parameters = new LinkedHashMap<>(request.parameters());
+            parameters.put("identity_provider", provider);
+            String href = authorizePath(requestContext) + "?" + formEncode(parameters);
+            links.add("<a href=\"" + escapeHtml(href) + "\">Sign in with " + escapeHtml(provider) + "</a>");
+        }
+        return links;
+    }
+
     /**
      * The first page of the sign-in: the username and password form, or, with choice-based sign-in,
      * the username alone.
@@ -714,7 +784,7 @@ public class CognitoOAuthController {
 
     private Response passwordPage(ContainerRequestContext requestContext, AuthorizationRequest request,
                                   Response.Status status, String error, String username) {
-        return signInPage(requestContext, request, status, error, List.of(
+        return signInPage(requestContext, request, status, error, true, List.of(
                 "<label for=\"username\">Username</label>",
                 usernameInput(request, username),
                 "<label for=\"password\">Password</label>",
@@ -725,7 +795,7 @@ public class CognitoOAuthController {
 
     private Response usernamePage(ContainerRequestContext requestContext, AuthorizationRequest request,
                                   Response.Status status, String error, String username) {
-        return signInPage(requestContext, request, status, error, List.of(
+        return signInPage(requestContext, request, status, error, true, List.of(
                 "<label for=\"username\">Username</label>",
                 usernameInput(request, username),
                 "<button type=\"submit\">Next</button>"));
@@ -741,12 +811,12 @@ public class CognitoOAuthController {
             fields.add("<button type=\"submit\" name=\"challenge\" value=\"" + escapeHtml(factor) + "\">"
                     + label + "</button>");
         }
-        return signInPage(requestContext, request, status, error, fields);
+        return signInPage(requestContext, request, status, error, false, fields);
     }
 
     private Response codePage(ContainerRequestContext requestContext, AuthorizationRequest request,
                               Response.Status status, String error, String username, String userAuthSession) {
-        return signInPage(requestContext, request, status, error, List.of(
+        return signInPage(requestContext, request, status, error, false, List.of(
                 hiddenField("username", username),
                 hiddenField("session", userAuthSession),
                 "<p>Enter the code we sent to your email address.</p>",
@@ -770,17 +840,30 @@ public class CognitoOAuthController {
 
     /**
      * A sign-in page, deliberately plain: {@code fields}, and the authorization request in hidden
-     * fields. Each rendering sets a fresh CSRF token cookie that the form echoes back.
+     * fields. Each rendering sets a fresh CSRF token cookie that the form echoes back. With
+     * {@code withProviders}, the first page of the sign-in, it also links to each external provider
+     * the client supports, as AWS's page does; with no {@code fields}, it is only those links.
      */
     private Response signInPage(ContainerRequestContext requestContext, AuthorizationRequest request,
-                                Response.Status status, String error, List<String> fields) {
+                                Response.Status status, String error, boolean withProviders, List<String> fields) {
         String csrfToken = stateStore.generateOpaqueKey();
-        List<String> formFields = new ArrayList<>();
-        for (Map.Entry<String, String> parameter : request.parameters().entrySet()) {
-            formFields.add("      " + hiddenField(parameter.getKey(), parameter.getValue()));
+        StringBuilder body = new StringBuilder();
+        if (!fields.isEmpty()) {
+            List<String> formFields = new ArrayList<>();
+            formFields.add("      " + hiddenField(CSRF_FIELD, csrfToken));
+            for (Map.Entry<String, String> parameter : request.parameters().entrySet()) {
+                formFields.add("      " + hiddenField(parameter.getKey(), parameter.getValue()));
+            }
+            for (String field : fields) {
+                formFields.add("      " + field);
+            }
+            body.append("    <form method=\"post\" action=\"").append(escapeHtml(loginPath(requestContext)))
+                    .append("\">\n").append(String.join("\n", formFields)).append("\n    </form>\n");
         }
-        for (String field : fields) {
-            formFields.add("      " + field);
+        if (withProviders) {
+            for (String link : providerLinks(requestContext, request)) {
+                body.append("    <p>").append(link).append("</p>\n");
+            }
         }
         String page = """
                 <!doctype html>
@@ -794,16 +877,10 @@ public class CognitoOAuthController {
                   <main>
                     <h1>Sign in</h1>
                 %s
-                    <form method="post" action="%s">
-                      <input type="hidden" name="%s" value="%s">
-                %s
-                    </form>
-                  </main>
+                %s  </main>
                 </body>
                 </html>
-                """.formatted(error == null ? "" : "    <p role=\"alert\">" + escapeHtml(error) + "</p>",
-                escapeHtml(loginPath(requestContext)), CSRF_FIELD, escapeHtml(csrfToken),
-                String.join("\n", formFields));
+                """.formatted(error == null ? "" : "    <p role=\"alert\">" + escapeHtml(error) + "</p>", body);
         // No form-action directive: browsers apply it to the redirect after the form is submitted,
         // which goes to the client's callback on another origin.
         return Response.status(status)
