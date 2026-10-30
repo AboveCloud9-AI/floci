@@ -5,6 +5,7 @@ import io.quarkus.runtime.annotations.RegisterForReflection;
 
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -37,6 +38,7 @@ public class CognitoUser {
     private boolean webAuthnMfaEnabled;
     private String federatedProviderName;
     private String federatedSubject;
+    private Map<String, CognitoDevice> devices = new LinkedHashMap<>();
 
     public CognitoUser() {
         long now = System.currentTimeMillis() / 1000L;
@@ -151,5 +153,13 @@ public class CognitoUser {
 
     public void setFederatedSubject(String federatedSubject) {
         this.federatedSubject = federatedSubject;
+    }
+
+    public Map<String, CognitoDevice> getDevices() {
+        return devices;
+    }
+
+    public void setDevices(Map<String, CognitoDevice> devices) {
+        this.devices = devices == null ? new LinkedHashMap<>() : new LinkedHashMap<>(devices);
     }
 }
