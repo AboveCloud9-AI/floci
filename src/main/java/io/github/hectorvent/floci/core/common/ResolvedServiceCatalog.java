@@ -96,6 +96,7 @@ import io.github.hectorvent.floci.services.ses.SesTagController;
 import io.github.hectorvent.floci.services.ses.SesTemplateController;
 import io.github.hectorvent.floci.services.ses.SesTenantController;
 import io.github.hectorvent.floci.services.signin.SigninController;
+import io.github.hectorvent.floci.services.amplify.AmplifyController;
 import io.github.hectorvent.floci.services.ssooidc.SsoOidcController;
 import io.github.hectorvent.floci.services.ssoportal.SsoPortalController;
 import io.github.hectorvent.floci.services.swf.model.SwfConstants;
@@ -657,6 +658,10 @@ public class ResolvedServiceCatalog {
                         "oam", config.storage().mode(), 5000L, null, ServiceProtocol.REST_JSON,
                         protocols(ServiceProtocol.REST_JSON),
                         Set.of(), Set.of("oam"), Set.of(), Set.of(OamController.class)),
+                descriptor("amplify", "amplify", config.services().amplify().enabled(), true,
+                        "amplify", config.storage().mode(), 5000L, null, ServiceProtocol.REST_JSON,
+                        protocols(ServiceProtocol.REST_JSON),
+                        Set.of(), Set.of("amplify"), Set.of(), Set.of(AmplifyController.class)),
                 descriptor("cloudfront", "cloudfront", config.services().cloudfront().enabled(), true,
                         "cloudfront", storageMode(config.storage().services().cloudfront().mode(), config.storage().mode()),
                         5000L, AwsNamespaces.CLOUDFRONT, ServiceProtocol.REST_XML,
