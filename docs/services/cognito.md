@@ -257,7 +257,7 @@ further divergences, both deliberate:
 |--------|-------------|
 | AdminCreateUser | Creates a user and sends the invitation, or with `MessageAction` `RESEND` gives an existing `FORCE_CHANGE_PASSWORD` user a new temporary password and sends the invitation again. See [AdminCreateUser invitations](#admincreateuser-invitations). Creating a user invokes the pre sign-up trigger with triggerSource `PreSignUp_AdminCreateUser`, the request's `ValidationData` and `ClientMetadata`, and `callerContext.clientId` `CLIENT_ID_NOT_APPLICABLE`. A trigger error refuses the user with `UserLambdaValidationException`, and its `autoConfirmUser`, `autoVerifyEmail` and `autoVerifyPhone` are ignored, as on AWS. |
 | AdminGetUser | Returns a user's stored attributes and status, and the MFA settings (`UserMFASettingList`, `PreferredMfaSetting`) once any is turned on. |
-| AdminDeleteUser | Deletes a user from a user pool. An API Gateway Cognito authorizer rejects the user's existing tokens afterwards. |
+| AdminDeleteUser | Deletes a user from a user pool, with the user's devices. An API Gateway Cognito authorizer rejects the user's existing tokens afterwards. |
 | AdminSetUserPassword | Sets a user's password and permanent-password status. |
 | AdminUpdateUserAttributes | Updates attributes for a user in a user pool. |
 | AdminDeleteUserAttributes | Deletes the named attributes from a user, along with any pending verification of them. |
@@ -486,6 +486,20 @@ check is `NotAuthorizedException`.
 |--------|-------------|
 | ListUsers | Lists users stored in a user pool. |
 
+### Devices
+
+| Action | Description |
+|--------|-------------|
+| ConfirmDevice | Confirms a device issued at sign-in (`NewDeviceMetadata`) for the access-token user and stores its name and `DeviceSecretVerifierConfig`. `UserConfirmationNecessary` is the pool's `DeviceOnlyRememberedOnUserPrompt`. |
+| AdminListDevices | Lists a user's confirmed devices, paginated with `Limit` (1-60, default 60) and `PaginationToken`. |
+| ListDevices | Lists the access-token user's confirmed devices, paginated like `AdminListDevices`. |
+| AdminGetDevice | Returns one of a user's confirmed devices. |
+| GetDevice | Returns one of the access-token user's confirmed devices. |
+| AdminForgetDevice | Removes one of a user's devices. |
+| ForgetDevice | Removes one of the access-token user's devices. `DeviceKey` is required. |
+| AdminUpdateDeviceStatus | Sets a user's device to `remembered` or `not_remembered`. |
+| UpdateDeviceStatus | Sets one of the access-token user's devices to `remembered` or `not_remembered`. |
+
 ## Supported AuthFlow Values
 
 `InitiateAuth` accepts `USER_PASSWORD_AUTH`, `USER_SRP_AUTH`, `CUSTOM_AUTH`, `USER_AUTH`,
@@ -587,6 +601,48 @@ Key" otherwise) and keeps a sign-up's user; a function that cannot be invoked fa
 `CustomEmailSender_AdminCreateUser` and `CustomEmailSender_AccountTakeOverNotification` are not
 emulated, since Floci sends no invitations and has no threat protection, and neither is the
 `CustomSMSSender` trigger: SMS codes still go through SNS.
+## Device Tracking
+
+A pool tracks devices when it has a `DeviceConfiguration` (`CreateUserPool`, `UpdateUserPool`,
+returned by `DescribeUserPool`). On such a pool, every sign-in that issues tokens through
+`InitiateAuth`, `AdminInitiateAuth`, `RespondToAuthChallenge` or `AdminRespondToAuthChallenge`
+(`USER_PASSWORD_AUTH`, `ADMIN_USER_PASSWORD_AUTH`, `USER_SRP_AUTH`, `USER_AUTH`, `CUSTOM_AUTH` and the
+`NEW_PASSWORD_REQUIRED` answer) works out which device it is for:
+
+- A sign-in that presents the key of one of the user's confirmed devices as `DEVICE_KEY` (in
+  `AuthParameters`, or in `ChallengeResponses` for a challenge answer) is for that device. The
+  PostAuthentication event gets `newDeviceUsed: false`, the device's `DeviceLastAuthenticatedDate`
+  moves to now, and no `NewDeviceMetadata` is returned.
+- Any other sign-in, including one with an unknown, unconfirmed or forgotten key, is for a new
+  device. The PostAuthentication event gets `newDeviceUsed: true` and `AuthenticationResult` carries
+  `NewDeviceMetadata` with a `DeviceKey` of the form `<region>_<uuid>` and a `DeviceGroupKey`.
+
+Either way the access token carries the device's key as the `device_key` claim. A pool without
+`DeviceConfiguration` returns no `NewDeviceMetadata` and sends `newDeviceUsed: false`.
+
+A new device is tracked, and counted by `AdminListDevices`, `ListDevices`, `AdminGetDevice` and
+`GetDevice`, only once `ConfirmDevice` is called with it, as on AWS. Until then it is kept as
+unconfirmed (the 20 most recent per user) so that `ConfirmDevice` can check the key was issued to
+that user; an unconfirmed or unknown key fails with `ResourceNotFoundException`. A confirmed
+device is `remembered`, or `not_remembered` when the pool sets
+`DeviceOnlyRememberedOnUserPrompt`, until `UpdateDeviceStatus` changes it. `DeviceAttributes` holds
+`device_status` (`valid`), `device_name` and `dev:device_remembered_status`; the dates are epoch
+seconds.
+
+`REFRESH_TOKEN_AUTH` never returns `NewDeviceMetadata`. When it presents a confirmed device's
+`DEVICE_KEY`, that device's `DeviceLastAuthenticatedDate` moves to now and the new access token
+carries its `device_key`; a missing or unknown `DEVICE_KEY` is accepted.
+
+A PostAuthentication function that returns an error blocks the sign-in with
+`UserLambdaValidationException` (`PostAuthentication failed with error <message>.`), and no tokens
+or device are issued. A function that cannot be invoked at all is logged and does not block.
+
+Devices are stored with their user, so `AdminDeleteUser` and `DeleteUserPool` remove them.
+
+Not implemented: `ChallengeRequiredOnNewDevice` is stored and returned but does not add an MFA
+challenge, the `DEVICE_SRP_AUTH` and `DEVICE_PASSWORD_VERIFIER` challenges are never issued (a
+remembered device signs in with the user's own credentials only), `last_ip_used` is not recorded,
+and `GetTokensFromRefreshToken` ignores `DeviceKey`.
 
 ## User Attribute Update Verification
 

@@ -95,7 +95,7 @@ final class CognitoAuthFlowHandler {
     private record SrpSession(String userPoolId, String username, String clientId,
                               String aHex, String bHex, String bPublicHex,
                               String secretBlockBase64, Map<String, String> clientMetadata,
-                              Instant expiresAt) {}
+                              String deviceKey, Instant expiresAt) {}
 
     private record PasswordChangeSession(String userPoolId, String username, String clientId, Instant expiresAt) {}
 
@@ -133,6 +133,7 @@ final class CognitoAuthFlowHandler {
         Map<String, String> clientMetadata = Map.of();
         String currentChallengeName;
         SrpSession srpSession;
+        String deviceKey;
 
         CustomAuthSession(String userPoolId, String username, String clientId) {
             this.userPoolId = userPoolId;
@@ -554,7 +555,8 @@ final class CognitoAuthFlowHandler {
                 passwordChangeSessions.remove(session, pending);
             }
             CognitoUser user = applyNewPasswordAttributes(pool, responses);
-            return completePrimaryAuth(pool, client, user, "TokenGeneration_NewPasswordChallenge", clientMetadata);
+            return completePrimaryAuth(pool, client, user, "TokenGeneration_NewPasswordChallenge", clientMetadata,
+                    responses.get("DEVICE_KEY"));
         }
         throw new AwsException("InvalidParameterException", "Unsupported challenge: " + challengeName, 400);
     }
@@ -598,7 +600,8 @@ final class CognitoAuthFlowHandler {
             return buildNewPasswordRequiredChallenge(pool, client, user);
         }
 
-        return completePrimaryAuth(pool, client, user, "TokenGeneration_Authentication", clientMetadata);
+        return completePrimaryAuth(pool, client, user, "TokenGeneration_Authentication", clientMetadata,
+                params.get("DEVICE_KEY"));
     }
 
     /**
@@ -781,6 +784,10 @@ final class CognitoAuthFlowHandler {
         }
         CognitoService.ClaimsOverride override = firePreTokenGeneration(pool, client, user,
                 clientMetadata, "TokenGeneration_RefreshTokens", scopes);
+        String deviceKey = service.touchDeviceOnRefresh(pool, user, params.get("DEVICE_KEY"));
+        if (deviceKey != null) {
+            override = CognitoService.mergeUnderProtocolClaims(override, deviceKeyClaim(deviceKey));
+        }
         Map<String, Object> result = new HashMap<>();
         result.put("AuthenticationResult", service.accessAndIdTokens(user, pool, client, override, refreshTokenUuid,
                 scopes, CognitoService.refreshTokenAuthTime(parts, iat)));
@@ -899,7 +906,8 @@ final class CognitoAuthFlowHandler {
         purgeExpired(srpSessions, SrpSession::expiresAt);
         SrpSession srp = new SrpSession(pool.getId(), user.getUsername(), client.getClientId(),
                 aHex, bHex, bPublicHex, secretBlockBase64,
-                clientMetadata == null ? Map.of() : clientMetadata, sessionExpiry(client, clock.instant()));
+                clientMetadata == null ? Map.of() : clientMetadata, authParameters.get("DEVICE_KEY"),
+                sessionExpiry(client, clock.instant()));
         if (custom == null) {
             srpSessions.put(sessionToken, srp);
         } else {
@@ -952,7 +960,8 @@ final class CognitoAuthFlowHandler {
             return buildNewPasswordRequiredChallenge(pool, client, user);
         }
 
-        return completePrimaryAuth(pool, client, user, "TokenGeneration_Authentication", effectiveMetadata);
+        return completePrimaryAuth(pool, client, user, "TokenGeneration_Authentication", effectiveMetadata,
+                responses.getOrDefault("DEVICE_KEY", srp.deviceKey()));
     }
 
     private static void validateSrpPublicValue(String aHex) {
@@ -1182,7 +1191,7 @@ final class CognitoAuthFlowHandler {
         if (userVerified && passkeySatisfiesMfa(pool, user)) {
             return authenticationResult(pool, client, user, "TokenGeneration_Authentication", clientMetadata);
         }
-        return completePrimaryAuth(pool, client, user, "TokenGeneration_Authentication", clientMetadata);
+        return completePrimaryAuth(pool, client, user, "TokenGeneration_Authentication", clientMetadata, null);
     }
 
     /** Whether the pool lets a passkey that verified the user stand in for MFA. */
@@ -1219,7 +1228,8 @@ final class CognitoAuthFlowHandler {
         if (user.isTemporaryPassword() || "FORCE_CHANGE_PASSWORD".equals(user.getUserStatus())) {
             return buildNewPasswordRequiredChallenge(pool, client, user);
         }
-        return completePrimaryAuth(pool, client, user, "TokenGeneration_Authentication", clientMetadata);
+        return completePrimaryAuth(pool, client, user, "TokenGeneration_Authentication", clientMetadata,
+                responses.get("DEVICE_KEY"));
     }
 
     /**
@@ -1506,6 +1516,7 @@ final class CognitoAuthFlowHandler {
             }
             state.history.add(new HashMap<>(Map.of("challengeName", "SRP_A", "challengeResult", true)));
         }
+        state.deviceKey = authParameters.get("DEVICE_KEY");
 
         Map<String, Object> defineResp = defineAuthChallenge(pool, client, user, state);
         if (Boolean.TRUE.equals(defineResp.get("failAuthentication"))) {
@@ -1514,7 +1525,8 @@ final class CognitoAuthFlowHandler {
         if (Boolean.TRUE.equals(defineResp.get("issueTokens"))) {
             Map<String, Object> result = new HashMap<>();
             result.put("AuthenticationResult",
-                    issueTokens(pool, client, user, "TokenGeneration_Authentication", state.clientMetadata));
+                    issueTokens(pool, client, user, "TokenGeneration_Authentication", state.clientMetadata,
+                            state.deviceKey));
             return result;
         }
 
@@ -1548,6 +1560,9 @@ final class CognitoAuthFlowHandler {
                                                        String session, Map<String, String> responses,
                                                        Map<String, String> clientMetadata) {
         CustomAuthSession state = requireCustomSession(pool, client, session, "CUSTOM_CHALLENGE");
+        if (responses.get("DEVICE_KEY") != null) {
+            state.deviceKey = responses.get("DEVICE_KEY");
+        }
 
         String answer = responses.get("ANSWER");
         if (answer == null) answer = responses.get("custom:ANSWER");
@@ -1584,7 +1599,8 @@ final class CognitoAuthFlowHandler {
             customAuthSessions.remove(session);
             Map<String, Object> result = new HashMap<>();
             result.put("AuthenticationResult",
-                    issueTokens(pool, client, user, "TokenGeneration_Authentication", state.clientMetadata));
+                    issueTokens(pool, client, user, "TokenGeneration_Authentication", state.clientMetadata,
+                            state.deviceKey));
             return result;
         }
 
@@ -1621,6 +1637,9 @@ final class CognitoAuthFlowHandler {
         if (!state.userPoolId.equals(pool.getId()) || !state.clientId.equals(client.getClientId())) {
             throw new AwsException("NotAuthorizedException", "Session does not match client", 400);
         }
+        if (responses.get("DEVICE_KEY") != null) {
+            state.deviceKey = responses.get("DEVICE_KEY");
+        }
 
         String password = responses.get("ANSWER");
         if (password == null) password = responses.get("PASSWORD_CLAIM_SIGNATURE");
@@ -1650,7 +1669,8 @@ final class CognitoAuthFlowHandler {
         }
         if (Boolean.TRUE.equals(defineResp.get("issueTokens"))) {
             customAuthSessions.remove(session);
-            return completePrimaryAuth(pool, client, user, "TokenGeneration_Authentication", state.clientMetadata);
+            return completePrimaryAuth(pool, client, user, "TokenGeneration_Authentication", state.clientMetadata,
+                    state.deviceKey);
         }
 
         String nextChallenge = (String) defineResp.getOrDefault("challengeName", "CUSTOM_CHALLENGE");
@@ -1718,7 +1738,8 @@ final class CognitoAuthFlowHandler {
         }
         boolean passwordChange = user.isTemporaryPassword() || "FORCE_CHANGE_PASSWORD".equals(user.getUserStatus());
         if (!passwordChange && Boolean.TRUE.equals(decision.get("issueTokens"))) {
-            return completePrimaryAuth(pool, client, user, "TokenGeneration_Authentication", state.clientMetadata);
+            return completePrimaryAuth(pool, client, user, "TokenGeneration_Authentication", state.clientMetadata,
+                    state.deviceKey);
         }
         String challengeName = passwordChange ? "NEW_PASSWORD_REQUIRED"
                 : (String) decision.getOrDefault("challengeName", "CUSTOM_CHALLENGE");
@@ -2327,10 +2348,11 @@ final class CognitoAuthFlowHandler {
      * MFA sets up an authenticator for a user with no factor it can use, when it offers software-token MFA.
      */
     private Map<String, Object> completePrimaryAuth(UserPool pool, UserPoolClient client, CognitoUser user,
-                                                     String triggerSource, Map<String, String> clientMetadata) {
+                                                     String triggerSource, Map<String, String> clientMetadata,
+                                                     String deviceKey) {
         String mode = pool.getMfaConfiguration();
         if (!"ON".equals(mode) && !"OPTIONAL".equals(mode)) {
-            return authenticationResult(pool, client, user, triggerSource, clientMetadata);
+            return authenticationResult(pool, client, user, triggerSource, clientMetadata, deviceKey);
         }
         Map<String, String> metadata = clientMetadata == null ? Map.of() : Map.copyOf(clientMetadata);
         List<String> factors = mfaFactors(pool, user);
@@ -2338,7 +2360,7 @@ final class CognitoAuthFlowHandler {
             if ("ON".equals(mode) && Boolean.TRUE.equals(pool.getSoftwareTokenMfaEnabled())) {
                 return totpChallenge(pool, client, user, TotpPhase.SETUP, triggerSource, metadata);
             }
-            return authenticationResult(pool, client, user, triggerSource, clientMetadata);
+            return authenticationResult(pool, client, user, triggerSource, clientMetadata, deviceKey);
         }
         String preferred = CognitoService.preferredMfaSetting(pool, user);
         if (preferred != null && factors.contains(preferred)) {
@@ -2532,17 +2554,41 @@ final class CognitoAuthFlowHandler {
 
     private Map<String, Object> authenticationResult(UserPool pool, UserPoolClient client, CognitoUser user,
                                                       String triggerSource, Map<String, String> clientMetadata) {
+        return authenticationResult(pool, client, user, triggerSource, clientMetadata, null);
+    }
+
+    private Map<String, Object> authenticationResult(UserPool pool, UserPoolClient client, CognitoUser user,
+                                                      String triggerSource, Map<String, String> clientMetadata,
+                                                      String deviceKey) {
         Map<String, Object> result = new HashMap<>();
-        result.put("AuthenticationResult", issueTokens(pool, client, user, triggerSource, clientMetadata));
+        result.put("AuthenticationResult", issueTokens(pool, client, user, triggerSource, clientMetadata, deviceKey));
         return result;
     }
 
     private Map<String, Object> issueTokens(UserPool pool, UserPoolClient client, CognitoUser user,
-                                             String triggerSource, Map<String, String> clientMetadata) {
-        firePostAuthentication(pool, client, user, clientMetadata, false);
+                                             String triggerSource, Map<String, String> clientMetadata,
+                                             String presentedDeviceKey) {
+        CognitoService.DeviceSignIn device = service.resolveDeviceSignIn(pool, user, presentedDeviceKey);
+        firePostAuthentication(pool, client, user, clientMetadata, device.newDeviceUsed());
         CognitoService.ClaimsOverride override = firePreTokenGeneration(pool, client, user, clientMetadata, triggerSource,
                 List.of());
-        return service.generateAuthResult(user, pool, client, override);
+        if (device.tracked()) {
+            override = CognitoService.mergeUnderProtocolClaims(override, deviceKeyClaim(device.deviceKey()));
+        }
+        Map<String, Object> auth = service.generateAuthResult(user, pool, client, override);
+        service.commitDeviceSignIn(pool, user, device);
+        if (device.newDeviceUsed()) {
+            Map<String, Object> metadata = new LinkedHashMap<>();
+            metadata.put("DeviceKey", device.deviceKey());
+            metadata.put("DeviceGroupKey", device.deviceGroupKey());
+            auth.put("NewDeviceMetadata", metadata);
+        }
+        return auth;
+    }
+
+    static CognitoService.ClaimsOverride deviceKeyClaim(String deviceKey) {
+        return new CognitoService.ClaimsOverride(null, null, Map.of("device_key", deviceKey), null,
+                null, null, null, null, null);
     }
 
     /** {@code scopes} are those of the grant being refreshed, or null for a sign-in through the API. */
