@@ -762,6 +762,8 @@ public interface EmulatorConfig {
         CurServiceConfig cur();
         BcmDataExportsServiceConfig bcmDataExports();
         OamServiceConfig oam();
+
+        AmplifyServiceConfig amplify();
         BcmPricingCalculatorServiceConfig bcmPricingCalculator();
         TimestreamInfluxDbServiceConfig timestreamInfluxdb();
         ConfigServiceConfig configservice();
@@ -2365,6 +2367,11 @@ public interface EmulatorConfig {
     }
 
     interface OamServiceConfig {
+        @WithDefault("true")
+        boolean enabled();
+    }
+
+    interface AmplifyServiceConfig {
         @WithDefault("true")
         boolean enabled();
     }
