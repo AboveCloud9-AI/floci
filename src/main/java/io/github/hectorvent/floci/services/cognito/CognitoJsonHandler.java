@@ -7,6 +7,8 @@ import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.core.common.AwsErrorResponse;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.PaginatedResult;
+import io.github.hectorvent.floci.services.cognito.model.CognitoDevice;
 import io.github.hectorvent.floci.services.cognito.model.CognitoGroup;
 import io.github.hectorvent.floci.services.cognito.model.CognitoUser;
 import io.github.hectorvent.floci.services.cognito.model.IdentityProvider;
@@ -124,6 +126,15 @@ public class CognitoJsonHandler {
             case "DeleteUserPoolClientSecret" -> handleDeleteUserPoolClientSecret(request);
             case "AdminSetUserMFAPreference" -> handleAdminSetUserMFAPreference(request);
             case "SetUserMFAPreference" -> handleSetUserMFAPreference(request);
+            case "ConfirmDevice" -> handleConfirmDevice(request);
+            case "AdminListDevices" -> handleAdminListDevices(request);
+            case "ListDevices" -> handleListDevices(request);
+            case "AdminGetDevice" -> handleAdminGetDevice(request);
+            case "GetDevice" -> handleGetDevice(request);
+            case "AdminForgetDevice" -> handleAdminForgetDevice(request);
+            case "ForgetDevice" -> handleForgetDevice(request);
+            case "AdminUpdateDeviceStatus" -> handleAdminUpdateDeviceStatus(request);
+            case "UpdateDeviceStatus" -> handleUpdateDeviceStatus(request);
             default -> Response.status(400)
                     .entity(new AwsErrorResponse("UnsupportedOperation", "Operation " + action + " is not supported."))
                     .build();
@@ -1502,6 +1513,117 @@ public class CognitoJsonHandler {
         );
 
         return Response.ok(objectMapper.createObjectNode()).build();
+    }
+
+    private Response handleConfirmDevice(JsonNode request) {
+        JsonNode verifier = request.path("DeviceSecretVerifierConfig");
+        boolean userConfirmationNecessary = service.confirmDevice(
+                request.path("AccessToken").asText(null),
+                request.path("DeviceKey").asText(null),
+                request.path("DeviceName").asText(null),
+                verifier.path("PasswordVerifier").asText(null),
+                verifier.path("Salt").asText(null));
+        ObjectNode response = objectMapper.createObjectNode();
+        response.put("UserConfirmationNecessary", userConfirmationNecessary);
+        return Response.ok(response).build();
+    }
+
+    private Response handleAdminListDevices(JsonNode request) {
+        return devicePageResponse(service.adminListDevices(
+                request.path("UserPoolId").asText(),
+                request.path("Username").asText(),
+                request.has("Limit") ? request.path("Limit").asInt() : null,
+                request.path("PaginationToken").asText(null)));
+    }
+
+    private Response handleListDevices(JsonNode request) {
+        return devicePageResponse(service.listDevices(
+                request.path("AccessToken").asText(null),
+                request.has("Limit") ? request.path("Limit").asInt() : null,
+                request.path("PaginationToken").asText(null)));
+    }
+
+    private Response handleAdminGetDevice(JsonNode request) {
+        CognitoDevice device = service.adminGetDevice(
+                request.path("UserPoolId").asText(),
+                request.path("Username").asText(),
+                request.path("DeviceKey").asText(null));
+        ObjectNode response = objectMapper.createObjectNode();
+        response.set("Device", deviceToNode(device));
+        return Response.ok(response).build();
+    }
+
+    private Response handleGetDevice(JsonNode request) {
+        CognitoDevice device = service.getDevice(
+                request.path("AccessToken").asText(null),
+                request.path("DeviceKey").asText(null));
+        ObjectNode response = objectMapper.createObjectNode();
+        response.set("Device", deviceToNode(device));
+        return Response.ok(response).build();
+    }
+
+    private Response handleAdminForgetDevice(JsonNode request) {
+        service.adminForgetDevice(
+                request.path("UserPoolId").asText(),
+                request.path("Username").asText(),
+                request.path("DeviceKey").asText(null));
+        return Response.ok(objectMapper.createObjectNode()).build();
+    }
+
+    private Response handleForgetDevice(JsonNode request) {
+        service.forgetDevice(
+                request.path("AccessToken").asText(null),
+                request.path("DeviceKey").asText(null));
+        return Response.ok(objectMapper.createObjectNode()).build();
+    }
+
+    private Response handleAdminUpdateDeviceStatus(JsonNode request) {
+        service.adminUpdateDeviceStatus(
+                request.path("UserPoolId").asText(),
+                request.path("Username").asText(),
+                request.path("DeviceKey").asText(null),
+                request.path("DeviceRememberedStatus").asText(null));
+        return Response.ok(objectMapper.createObjectNode()).build();
+    }
+
+    private Response handleUpdateDeviceStatus(JsonNode request) {
+        service.updateDeviceStatus(
+                request.path("AccessToken").asText(null),
+                request.path("DeviceKey").asText(null),
+                request.path("DeviceRememberedStatus").asText(null));
+        return Response.ok(objectMapper.createObjectNode()).build();
+    }
+
+    private Response devicePageResponse(PaginatedResult<CognitoDevice> page) {
+        ObjectNode response = objectMapper.createObjectNode();
+        ArrayNode devices = response.putArray("Devices");
+        page.items().forEach(d -> devices.add(deviceToNode(d)));
+        if (page.nextToken() != null) {
+            response.put("PaginationToken", page.nextToken());
+        }
+        return Response.ok(response).build();
+    }
+
+    private ObjectNode deviceToNode(CognitoDevice device) {
+        ObjectNode node = objectMapper.createObjectNode();
+        node.put("DeviceKey", device.getDeviceKey());
+        ArrayNode attrs = node.putArray("DeviceAttributes");
+        addDeviceAttribute(attrs, "device_status", "valid");
+        addDeviceAttribute(attrs, "device_name", device.getDeviceName());
+        addDeviceAttribute(attrs, "dev:device_remembered_status", device.getRememberedStatus());
+        node.put("DeviceCreateDate", device.getCreateDate());
+        node.put("DeviceLastModifiedDate", device.getLastModifiedDate());
+        node.put("DeviceLastAuthenticatedDate", device.getLastAuthenticatedDate());
+        return node;
+    }
+
+    private static void addDeviceAttribute(ArrayNode attrs, String name, String value) {
+        if (value == null) {
+            return;
+        }
+        ObjectNode attr = attrs.addObject();
+        attr.put("Name", name);
+        attr.put("Value", value);
     }
 
 }

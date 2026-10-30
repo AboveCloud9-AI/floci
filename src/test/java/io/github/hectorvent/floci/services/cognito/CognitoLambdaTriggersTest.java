@@ -294,20 +294,37 @@ class CognitoLambdaTriggersTest {
     }
 
     @Test
-    @SuppressWarnings("unchecked")
-    void postAuthenticationLambdaErrorDoesNotBlockAuth() {
+    void postAuthenticationLambdaErrorBlocksAuth() {
         UserPool pool = createPoolWithLambdaConfig(Map.of("PostAuthentication", "arn:aws:lambda:::post"));
         seedUser(pool, "alice", "Perm1234!");
         UserPoolClient client = createClient(pool);
 
         when(lambdaService.invoke(anyString(), eq("arn:aws:lambda:::post"), any(byte[].class), any()))
-                .thenReturn(lambdaError("Unhandled"));
+                .thenReturn(lambdaError("Unhandled", "Too many devices"));
+
+        AwsException ex = assertThrows(AwsException.class,
+                () -> service.initiateAuth(client.getClientId(), "USER_PASSWORD_AUTH",
+                        Map.of("USERNAME", "alice", "PASSWORD", "Perm1234!")));
+
+        assertEquals("UserLambdaValidationException", ex.getErrorCode());
+        assertEquals("PostAuthentication failed with error Too many devices.", ex.getMessage());
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void postAuthenticationInvocationFailureDoesNotBlockAuth() {
+        UserPool pool = createPoolWithLambdaConfig(Map.of("PostAuthentication", "arn:aws:lambda:::post"));
+        seedUser(pool, "alice", "Perm1234!");
+        UserPoolClient client = createClient(pool);
+
+        when(lambdaService.invoke(anyString(), eq("arn:aws:lambda:::post"), any(byte[].class), any()))
+                .thenThrow(new AwsException("ResourceNotFoundException", "Function not found", 404));
 
         Map<String, Object> result = service.initiateAuth(client.getClientId(), "USER_PASSWORD_AUTH",
                 Map.of("USERNAME", "alice", "PASSWORD", "Perm1234!"));
 
         Map<String, Object> auth = (Map<String, Object>) result.get("AuthenticationResult");
-        assertNotNull(auth, "Auth should still succeed when PostAuthentication errors");
+        assertNotNull(auth, "Auth should still succeed when the PostAuthentication function cannot be invoked");
         assertNotNull(auth.get("AccessToken"));
     }
 

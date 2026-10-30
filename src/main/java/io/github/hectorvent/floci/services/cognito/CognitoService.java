@@ -10,6 +10,8 @@ import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.config.TlsCertificateManager;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.PaginatedResult;
+import io.github.hectorvent.floci.core.common.Pagination;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.ReservedTags;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
@@ -22,6 +24,7 @@ import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.acm.AcmService;
 import io.github.hectorvent.floci.services.acm.model.Certificate;
 import io.github.hectorvent.floci.services.acm.model.CertificateStatus;
+import io.github.hectorvent.floci.services.cognito.model.CognitoDevice;
 import io.github.hectorvent.floci.services.cognito.model.CognitoGroup;
 import io.github.hectorvent.floci.services.cognito.model.CognitoUser;
 import io.github.hectorvent.floci.services.cognito.model.IdentityProvider;
@@ -142,6 +145,7 @@ public class CognitoService implements ResourceProvider {
     private final VerificationCodeService verificationCodeService;
     private final CognitoMessageDispatcher messageDispatcher;
     private final TlsCertificateManager certificateManager;
+    private final Clock clock;
     private final Object[] userLocks = newUserLockStripes();
 
     // Keyed by session token; contains SRP ephemeral state (bPrivate, B, A, secretBlock)
@@ -298,6 +302,7 @@ public class CognitoService implements ResourceProvider {
         this.verificationCodeService = verificationCodeService;
         this.messageDispatcher = messageDispatcher;
         this.certificateManager = certificateManager;
+        this.clock = clock;
         this.authFlowHandler = new CognitoAuthFlowHandler(this, lambdaService, regionResolver, clock);
     }
 
@@ -3402,7 +3407,7 @@ public class CognitoService implements ResourceProvider {
      * Layers {@code protocolClaims} over {@code trigger}, keeping every other field the trigger set
      * (suppressions, groups, roles, scopes).
      */
-    private static ClaimsOverride mergeUnderProtocolClaims(ClaimsOverride trigger, ClaimsOverride protocolClaims) {
+    static ClaimsOverride mergeUnderProtocolClaims(ClaimsOverride trigger, ClaimsOverride protocolClaims) {
         if (trigger == null) {
             return protocolClaims;
         }
@@ -4361,6 +4366,261 @@ public class CognitoService implements ResourceProvider {
     private void validateGroupName(String groupName) {
         if (groupName == null || groupName.isBlank()) {
             throw new AwsException("InvalidParameterException", "GroupName is required", 400);
+        }
+    }
+
+
+    // ──────────────────────────── Devices ────────────────────────────
+
+    /**
+     * How a sign-in relates to the user's devices. {@code deviceKey} is the device the tokens are
+     * issued for: the known device the client presented, or a new one when {@code newDeviceUsed}.
+     * Both keys are null when the pool does not track devices.
+     */
+    record DeviceSignIn(boolean newDeviceUsed, String deviceKey, String deviceGroupKey) {
+        static final DeviceSignIn UNTRACKED = new DeviceSignIn(false, null, null);
+
+        boolean tracked() {
+            return deviceKey != null;
+        }
+    }
+
+    private static final int MAX_UNCONFIRMED_DEVICES_PER_USER = 20;
+    private static final int DEFAULT_DEVICE_PAGE_SIZE = 60;
+    private static final String DEVICE_NOT_FOUND_MESSAGE = "Device does not exist.";
+    private static final String GROUP_KEY_ALPHABET =
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    private static final SecureRandom DEVICE_RANDOM = new SecureRandom();
+
+    static boolean deviceTrackingEnabled(UserPool pool) {
+        return pool.getDeviceConfiguration() != null && !pool.getDeviceConfiguration().isEmpty();
+    }
+
+    private static boolean deviceOnlyRememberedOnUserPrompt(UserPool pool) {
+        Object value = pool.getDeviceConfiguration() == null
+                ? null : pool.getDeviceConfiguration().get("DeviceOnlyRememberedOnUserPrompt");
+        return Boolean.TRUE.equals(value) || "true".equalsIgnoreCase(String.valueOf(value));
+    }
+
+    private long deviceNow() {
+        return clock.instant().getEpochSecond();
+    }
+
+    /**
+     * Decides which device a sign-in is for, without writing anything: a sign-in that presents
+     * the key of one of the user's confirmed devices is for that device; any other sign-in gets a
+     * new device key. {@link #commitDeviceSignIn} records the decision once the sign-in succeeds.
+     */
+    DeviceSignIn resolveDeviceSignIn(UserPool pool, CognitoUser user, String presentedDeviceKey) {
+        if (!deviceTrackingEnabled(pool)) {
+            return DeviceSignIn.UNTRACKED;
+        }
+        if (presentedDeviceKey != null && !presentedDeviceKey.isBlank()) {
+            CognitoDevice known = userStore.get(userKey(pool.getId(), user.getUsername()))
+                    .map(u -> u.getDevices().get(presentedDeviceKey))
+                    .filter(CognitoDevice::isConfirmed)
+                    .orElse(null);
+            if (known != null) {
+                return new DeviceSignIn(false, known.getDeviceKey(), known.getDeviceGroupKey());
+            }
+        }
+        String region = AwsArnUtils.regionOrDefault(pool.getArn(), regionResolver.getDefaultRegion());
+        StringBuilder groupKey = new StringBuilder("-");
+        for (int i = 0; i < 9; i++) {
+            groupKey.append(GROUP_KEY_ALPHABET.charAt(DEVICE_RANDOM.nextInt(GROUP_KEY_ALPHABET.length())));
+        }
+        return new DeviceSignIn(true, region + "_" + UUID.randomUUID(), groupKey.toString());
+    }
+
+    /**
+     * Records a successful sign-in: a known device gets its last-authenticated date moved on, and a
+     * new one is kept unconfirmed until {@code ConfirmDevice}. Only the most recent
+     * {@value #MAX_UNCONFIRMED_DEVICES_PER_USER} unconfirmed devices are kept per user.
+     */
+    void commitDeviceSignIn(UserPool pool, CognitoUser user, DeviceSignIn signIn) {
+        if (signIn == null || !signIn.tracked()) {
+            return;
+        }
+        synchronized (userLock(pool.getId(), user.getUsername())) {
+            CognitoUser stored = userStore.get(userKey(pool.getId(), user.getUsername())).orElse(null);
+            if (stored == null) {
+                return;
+            }
+            long now = deviceNow();
+            if (signIn.newDeviceUsed()) {
+                CognitoDevice device = new CognitoDevice();
+                device.setDeviceKey(signIn.deviceKey());
+                device.setDeviceGroupKey(signIn.deviceGroupKey());
+                device.setCreateDate(now);
+                device.setLastModifiedDate(now);
+                device.setLastAuthenticatedDate(now);
+                Map<String, CognitoDevice> devices = stored.getDevices();
+                List<CognitoDevice> unconfirmed = devices.values().stream()
+                        .filter(d -> !d.isConfirmed())
+                        .sorted(Comparator.comparingLong(CognitoDevice::getCreateDate))
+                        .toList();
+                for (int i = 0; i <= unconfirmed.size() - MAX_UNCONFIRMED_DEVICES_PER_USER; i++) {
+                    devices.remove(unconfirmed.get(i).getDeviceKey());
+                }
+                devices.put(device.getDeviceKey(), device);
+            } else {
+                CognitoDevice device = stored.getDevices().get(signIn.deviceKey());
+                if (device == null) {
+                    return;
+                }
+                device.setLastAuthenticatedDate(now);
+            }
+            userStore.put(userKey(pool.getId(), stored.getUsername()), stored);
+        }
+    }
+
+    /**
+     * A refresh that presents one of the user's confirmed devices counts as an authentication on
+     * that device. Returns the device key to stamp into the new access token, or null.
+     */
+    String touchDeviceOnRefresh(UserPool pool, CognitoUser user, String presentedDeviceKey) {
+        if (!deviceTrackingEnabled(pool) || presentedDeviceKey == null || presentedDeviceKey.isBlank()) {
+            return null;
+        }
+        DeviceSignIn signIn = resolveDeviceSignIn(pool, user, presentedDeviceKey);
+        if (signIn.newDeviceUsed()) {
+            return null;
+        }
+        commitDeviceSignIn(pool, user, signIn);
+        return signIn.deviceKey();
+    }
+
+    public boolean confirmDevice(String accessToken, String deviceKey, String deviceName,
+                                 String passwordVerifier, String salt) {
+        VerifiedAccessToken token = verifyAccessToken(accessToken);
+        requireDeviceKey(deviceKey);
+        UserPool pool = describeUserPool(token.poolId());
+        synchronized (userLock(token.poolId(), token.username())) {
+            CognitoUser user = adminGetUser(token.poolId(), token.username());
+            CognitoDevice device = user.getDevices().get(deviceKey);
+            if (device == null) {
+                throw new AwsException("ResourceNotFoundException", DEVICE_NOT_FOUND_MESSAGE, 400);
+            }
+            boolean userConfirmationNecessary = deviceOnlyRememberedOnUserPrompt(pool);
+            if (!device.isConfirmed()) {
+                device.setConfirmed(true);
+                device.setRememberedStatus(userConfirmationNecessary
+                        ? CognitoDevice.NOT_REMEMBERED : CognitoDevice.REMEMBERED);
+            }
+            if (deviceName != null && !deviceName.isBlank()) {
+                device.setDeviceName(deviceName);
+            }
+            if (passwordVerifier != null) {
+                device.setPasswordVerifier(passwordVerifier);
+            }
+            if (salt != null) {
+                device.setSalt(salt);
+            }
+            device.setLastModifiedDate(deviceNow());
+            userStore.put(userKey(token.poolId(), user.getUsername()), user);
+            return userConfirmationNecessary;
+        }
+    }
+
+    public PaginatedResult<CognitoDevice> adminListDevices(String userPoolId, String username,
+                                                          Integer limit, String paginationToken) {
+        describeUserPool(userPoolId);
+        return listConfirmedDevices(adminGetUser(userPoolId, username), limit, paginationToken);
+    }
+
+    public PaginatedResult<CognitoDevice> listDevices(String accessToken, Integer limit, String paginationToken) {
+        VerifiedAccessToken token = verifyAccessToken(accessToken);
+        return listConfirmedDevices(adminGetUser(token.poolId(), token.username()), limit, paginationToken);
+    }
+
+    private static PaginatedResult<CognitoDevice> listConfirmedDevices(CognitoUser user, Integer limit,
+                                                                      String paginationToken) {
+        List<CognitoDevice> confirmed = user.getDevices().values().stream()
+                .filter(CognitoDevice::isConfirmed)
+                .toList();
+        Integer pageSize = limit == null || limit == 0 ? null : limit;
+        return Pagination.paginate(confirmed, CognitoDevice::getDeviceKey, pageSize, paginationToken,
+                DEFAULT_DEVICE_PAGE_SIZE, "InvalidParameterException");
+    }
+
+    public CognitoDevice adminGetDevice(String userPoolId, String username, String deviceKey) {
+        describeUserPool(userPoolId);
+        requireDeviceKey(deviceKey);
+        return confirmedDevice(adminGetUser(userPoolId, username), deviceKey);
+    }
+
+    public CognitoDevice getDevice(String accessToken, String deviceKey) {
+        VerifiedAccessToken token = verifyAccessToken(accessToken);
+        requireDeviceKey(deviceKey);
+        return confirmedDevice(adminGetUser(token.poolId(), token.username()), deviceKey);
+    }
+
+    public void adminForgetDevice(String userPoolId, String username, String deviceKey) {
+        describeUserPool(userPoolId);
+        requireDeviceKey(deviceKey);
+        forgetDevice(userPoolId, adminGetUser(userPoolId, username).getUsername(), deviceKey);
+    }
+
+    public void forgetDevice(String accessToken, String deviceKey) {
+        VerifiedAccessToken token = verifyAccessToken(accessToken);
+        requireDeviceKey(deviceKey);
+        forgetDevice(token.poolId(), adminGetUser(token.poolId(), token.username()).getUsername(), deviceKey);
+    }
+
+    private void forgetDevice(String userPoolId, String username, String deviceKey) {
+        synchronized (userLock(userPoolId, username)) {
+            CognitoUser user = adminGetUser(userPoolId, username);
+            confirmedDevice(user, deviceKey);
+            user.getDevices().remove(deviceKey);
+            userStore.put(userKey(userPoolId, user.getUsername()), user);
+        }
+    }
+
+    public void adminUpdateDeviceStatus(String userPoolId, String username, String deviceKey,
+                                        String rememberedStatus) {
+        describeUserPool(userPoolId);
+        requireDeviceKey(deviceKey);
+        updateDeviceStatus(userPoolId, adminGetUser(userPoolId, username).getUsername(), deviceKey,
+                rememberedStatus);
+    }
+
+    public void updateDeviceStatus(String accessToken, String deviceKey, String rememberedStatus) {
+        VerifiedAccessToken token = verifyAccessToken(accessToken);
+        requireDeviceKey(deviceKey);
+        updateDeviceStatus(token.poolId(), adminGetUser(token.poolId(), token.username()).getUsername(),
+                deviceKey, rememberedStatus);
+    }
+
+    private void updateDeviceStatus(String userPoolId, String username, String deviceKey, String rememberedStatus) {
+        if (rememberedStatus != null && !CognitoDevice.REMEMBERED.equals(rememberedStatus)
+                && !CognitoDevice.NOT_REMEMBERED.equals(rememberedStatus)) {
+            throw new AwsException("InvalidParameterException",
+                    "1 validation error detected: Value '" + rememberedStatus
+                            + "' at 'deviceRememberedStatus' failed to satisfy constraint: "
+                            + "Member must satisfy enum value set: [remembered, not_remembered]", 400);
+        }
+        synchronized (userLock(userPoolId, username)) {
+            CognitoUser user = adminGetUser(userPoolId, username);
+            CognitoDevice device = confirmedDevice(user, deviceKey);
+            if (rememberedStatus != null) {
+                device.setRememberedStatus(rememberedStatus);
+            }
+            device.setLastModifiedDate(deviceNow());
+            userStore.put(userKey(userPoolId, user.getUsername()), user);
+        }
+    }
+
+    private static CognitoDevice confirmedDevice(CognitoUser user, String deviceKey) {
+        CognitoDevice device = user.getDevices().get(deviceKey);
+        if (device == null || !device.isConfirmed()) {
+            throw new AwsException("ResourceNotFoundException", DEVICE_NOT_FOUND_MESSAGE, 400);
+        }
+        return device;
+    }
+
+    private static void requireDeviceKey(String deviceKey) {
+        if (deviceKey == null || deviceKey.isBlank()) {
+            throw new AwsException("InvalidParameterException", "DeviceKey is required", 400);
         }
     }
 
