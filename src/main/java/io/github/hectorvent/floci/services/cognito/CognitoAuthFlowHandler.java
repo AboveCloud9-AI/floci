@@ -886,12 +886,12 @@ final class CognitoAuthFlowHandler {
             throw new AwsException("NotAuthorizedException", "User does not support SRP auth", 400);
         }
 
-        return buildSrpChallenge(pool, client, user, aHex, clientMetadata, null);
+        return buildSrpChallenge(pool, client, user, aHex, clientMetadata, null, authParameters.get("DEVICE_KEY"));
     }
 
     private Map<String, Object> buildSrpChallenge(UserPool pool, UserPoolClient client, CognitoUser user,
                                                   String aHex, Map<String, String> clientMetadata,
-                                                  CustomAuthSession custom) {
+                                                  CustomAuthSession custom, String deviceKey) {
         validateSrpPublicValue(aHex);
         String[] serverB = CognitoSrpHelper.generateServerB(user.getSrpVerifier());
         String bHex = serverB[0];
@@ -906,7 +906,7 @@ final class CognitoAuthFlowHandler {
         purgeExpired(srpSessions, SrpSession::expiresAt);
         SrpSession srp = new SrpSession(pool.getId(), user.getUsername(), client.getClientId(),
                 aHex, bHex, bPublicHex, secretBlockBase64,
-                clientMetadata == null ? Map.of() : clientMetadata, authParameters.get("DEVICE_KEY"),
+                clientMetadata == null ? Map.of() : clientMetadata, deviceKey,
                 sessionExpiry(client, clock.instant()));
         if (custom == null) {
             srpSessions.put(sessionToken, srp);
@@ -1533,7 +1533,8 @@ final class CognitoAuthFlowHandler {
         String challengeName = (String) defineResp.getOrDefault("challengeName", "CUSTOM_CHALLENGE");
         state.currentChallengeName = challengeName;
         if (srpAuth && "PASSWORD_VERIFIER".equals(challengeName)) {
-            return buildSrpChallenge(pool, client, user, authParameters.get("SRP_A"), state.clientMetadata, state);
+            return buildSrpChallenge(pool, client, user, authParameters.get("SRP_A"), state.clientMetadata, state,
+                    state.deviceKey);
         }
 
         Map<String, String> publicParams = new HashMap<>();
