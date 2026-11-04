@@ -11,6 +11,7 @@ import io.github.hectorvent.floci.services.amplify.model.AmplifyApp;
 import io.github.hectorvent.floci.services.amplify.model.AmplifyBranch;
 import io.github.hectorvent.floci.services.amplify.model.AmplifyDomainAssociation;
 import io.github.hectorvent.floci.services.amplify.model.AmplifyJob;
+import io.github.hectorvent.floci.services.amplify.model.AmplifyProductionBranch;
 import io.github.hectorvent.floci.services.amplify.model.AmplifySubDomain;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
@@ -244,8 +245,8 @@ public class AmplifyService {
         AmplifyApp app = getApp(appId);
         if (app.getProductionBranch() == null
                 || branchName.equals(app.getProductionBranch().getBranchName())) {
-            io.github.hectorvent.floci.services.amplify.model.AmplifyProductionBranch production =
-                    new io.github.hectorvent.floci.services.amplify.model.AmplifyProductionBranch();
+            AmplifyProductionBranch production =
+                    new AmplifyProductionBranch();
             production.setBranchName(branchName);
             production.setStatus("SUCCEED");
             production.setLastDeployTime(now);

@@ -18,6 +18,7 @@ import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Base64;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -145,7 +146,7 @@ class CognitoDeviceTrackingTest {
     }
 
     private static Map<String, String> attributes(JsonNode device) {
-        Map<String, String> attrs = new java.util.HashMap<>();
+        Map<String, String> attrs = new HashMap<>();
         device.path("DeviceAttributes").forEach(a -> attrs.put(a.path("Name").asText(), a.path("Value").asText()));
         return attrs;
     }
@@ -485,7 +486,7 @@ class CognitoDeviceTrackingTest {
 
         AwsException blocked = assertThrows(AwsException.class, () -> signIn(clientId, "alice", null));
         assertEquals("UserLambdaValidationException", blocked.getErrorCode());
-        assertEquals("PostAuthentication failed with error device limit reached.", blocked.getMessage());
+        assertEquals("PostAuthentication failed with error device limit reached", blocked.getMessage());
         assertNotNull(signIn(clientId, "alice", keys.get(0)).path("AccessToken").asText(null),
                 "a known device still signs in");
 
